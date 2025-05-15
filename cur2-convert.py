@@ -151,7 +151,7 @@ class CURParquetConverter:
 
 
 
-    def process_cur_files(self, full_sync=False, hours=24, payer_id=None, tier=None):
+    def process_cur_files(self, full_sync=False, hours=24, payer_id=None, tier=None, path_filter=None):
         """处理CUR文件的主函数
         Args:
             full_sync (bool): 是否执行全量同步
@@ -197,7 +197,11 @@ class CURParquetConverter:
                             if obj['LastModified'].timestamp() < time_threshold:
                                 logger.debug(f"Skipping old file: {source_key} (LastModified: {obj['LastModified']})")
                                 continue
-                        
+                            
+                        # 如果指定了分区路径，检查文件是否在该分区中
+                        if path_filter and path_filter not in source_key:
+                            continue
+                            
                         logger.info(f"Processing file: {source_key} (LastModified: {obj['LastModified']})")
 
                         try:
@@ -246,12 +250,18 @@ def main():
                       help='指定要同步的 Payer Account ID')
     parser.add_argument('--tier', type=str, choices=['hourly', 'daily', 'monthly'],
                       help='指定要同步的数据粒度，不指定时处理所有粒度')
+    parser.add_argument('--path', type=str,
+                      help='指定要同步的分区路径，例如：BILLING_PERIOD=2025-01')
 
     args = parser.parse_args()
     
     # 检查参数冲突
     if args.full and args.hour is not None:
         parser.error("--full 和 --hour 参数不能同时使用")
+        
+    # 检查分区路径格式
+    if args.path and not args.path.startswith('BILLING_PERIOD='):
+        parser.error("--path 参数必须以 'BILLING_PERIOD=' 开头")
 
     # 设置日志
     logging.basicConfig(
@@ -263,7 +273,7 @@ def main():
     hours = None if args.full else (args.hour or 24)
     
     converter = CURParquetConverter()
-    converter.process_cur_files(full_sync=args.full, hours=hours, payer_id=args.payer, tier=args.tier)
+    converter.process_cur_files(full_sync=args.full, hours=hours, payer_id=args.payer, tier=args.tier, path_filter=args.path)
 
 if __name__ == "__main__":
     main()

@@ -36,7 +36,7 @@ class FileDownloader:
         # 创建使用IAM角色的S3客户端用于上传
         self.backup_s3_client = boto3.client('s3')
 
-    def download_files(self, account, full_sync, hours=24, tier=None):
+    def download_files(self, account, full_sync, hours=24, tier=None, path_filter=None):
         try:
             # 创建账号特定的S3客户端用于下载
             source_s3_client = boto3.client(
@@ -72,6 +72,10 @@ class FileDownloader:
                         
                         # 只处理过去24小时内修改过的文件（如果不是全量同步）
                         if time_threshold and last_modified < time_threshold:
+                            continue
+                            
+                        # 如果指定了分区路径，检查文件是否在该分区中
+                        if path_filter and path_filter not in file_key:
                             continue
                         
                         # 从文件路径中提取类型和其他路径信息
@@ -132,11 +136,17 @@ def main():
                       help='指定要同步的 AWS Payer Account ID')
     parser.add_argument('--tier', type=str, choices=['hourly', 'daily', 'monthly'],
                       help='指定要同步的数据粒度，不指定时处理所有粒度')
+    parser.add_argument('--path', type=str,
+                      help='指定要同步的分区路径，例如：BILLING_PERIOD=2025-01')
     args = parser.parse_args()
     
     # 检查参数冲突
     if args.full and args.hour is not None:
         parser.error("--full 和 --hour 参数不能同时使用")
+        
+    # 检查分区路径格式
+    if args.path and not args.path.startswith('BILLING_PERIOD='):
+        parser.error("--path 参数必须以 'BILLING_PERIOD=' 开头")
 
     local_download_dir = Path('downloads')
     local_download_dir.mkdir(exist_ok=True)
@@ -157,7 +167,7 @@ def main():
     
     for account in accounts:
         logger.info(f"处理账号: {account['name']} ({account['aws_id']})")
-        downloader.download_files(account, args.full, hours, args.tier)
+        downloader.download_files(account, args.full, args.hour, args.tier, args.path)
 
 if __name__ == "__main__":
     main()
