@@ -40,11 +40,58 @@ class CURParquetConverter:
         with gzip.GzipFile(fileobj=response['Body']) as gz:
             return pd.read_csv(gz, low_memory=False)
 
+    def _get_cur_schema(self) -> pa.Schema:
+        """获取 CUR 数据的标准 schema 定义"""
+        return pa.schema([
+            # 时间戳字段 - 使用无时区的毫秒级时间戳
+            ('line_item_usage_start_date', pa.timestamp('ms', tz=None)),
+            ('line_item_usage_end_date', pa.timestamp('ms', tz=None)),
+            ('pricing_public_on_demand_rate', pa.float64()),
+            ('pricing_public_on_demand_cost', pa.float64()),
+            ('line_item_unblended_rate', pa.float64()),
+            ('line_item_unblended_cost', pa.float64()),
+            # 其他字段可以根据需要添加
+        ])
+
+    def _standardize_cur_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        """标准化 CUR 数据格式"""
+        # 处理时间戳字段 - 确保时区一致性
+        time_columns = [
+            'line_item_usage_start_date',
+            'line_item_usage_end_date'
+        ]
+        
+        for col in time_columns:
+            if col in df.columns:
+                # 将时间字符串转换为 datetime 对象
+                df[col] = pd.to_datetime(df[col])
+                # 如果有时区信息，转换到 UTC 然后移除时区信息
+                if df[col].dt.tz is not None:
+                    df[col] = df[col].dt.tz_convert('UTC').dt.tz_localize(None)
+        
+        # 处理数值字段 - 确保类型一致性
+        numeric_columns = [
+            'pricing_public_on_demand_rate',
+            'pricing_public_on_demand_cost',
+            'line_item_unblended_rate',
+            'line_item_unblended_cost'
+        ]
+        
+        for col in numeric_columns:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+        
+        return df
+
     def _upload_parquet_to_s3(self, df: pd.DataFrame, target_key: str):
         """将DataFrame保存为Parquet格式并上传到S3"""
         with io.BytesIO() as buffer:
-            # 将数据转换为parquet格式
-            table = pa.Table.from_pandas(df)
+            # 标准化数据格式
+            df = self._standardize_cur_data(df)
+            
+            # 使用预定义的 schema 转换为 parquet 格式
+            schema = self._get_cur_schema()
+            table = pa.Table.from_pandas(df, schema=schema)
             pq.write_table(table, buffer)
             
             # 上传到S3
