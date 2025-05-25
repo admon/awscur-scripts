@@ -104,21 +104,23 @@ class CURParquetConverter:
 
     def _upload_parquet_to_s3(self, df: pd.DataFrame, target_key: str):
         """将DataFrame保存为Parquet格式并上传到S3"""
-        with io.BytesIO() as buffer:
-            # 标准化数据格式（只处理时间字段，其他字段保持原样）
-            df = self._standardize_cur_data(df)
-            
-            # 直接转换为 parquet 格式，保留所有字段
-            table = pa.Table.from_pandas(df)
-            pq.write_table(table, buffer)
-            
-            # 上传到S3
-            buffer.seek(0)
-            self.s3_client.put_object(
-                Bucket=self.target_bucket,
-                Key=target_key,
-                Body=buffer.getvalue()
-            )
+        try:
+            with io.BytesIO() as buffer:
+                # 直接转换为 parquet 格式，保留所有字段
+                table = pa.Table.from_pandas(df)
+                pq.write_table(table, buffer)
+                
+                # 上传到S3
+                buffer.seek(0)
+                self.s3_client.put_object(
+                    Bucket=self.target_bucket,
+                    Key=target_key,
+                    Body=buffer.getvalue()
+                )
+                logger.info(f"成功上传文件到: s3://{self.target_bucket}/{target_key}")
+        except Exception as e:
+            logger.error(f"上传文件失败: {target_key}, 错误: {str(e)}")
+            raise
 
 
 
@@ -151,6 +153,35 @@ class CURParquetConverter:
 
 
 
+    def _read_manifest_file(self, bucket: str, key: str) -> dict:
+        """读取并解析 Manifest 文件"""
+        try:
+            response = self.s3_client.get_object(Bucket=bucket, Key=key)
+            manifest_content = json.loads(response['Body'].read().decode('utf-8'))
+            return manifest_content
+        except Exception as e:
+            logger.error(f"读取 Manifest 文件失败: {key}, 错误: {str(e)}")
+            raise
+
+    def _list_manifest_files(self, bucket: str, prefix: str) -> list:
+        """列出目录中的 Manifest 文件
+        只处理指定 BILLING_PERIOD 目录下的 Manifest 文件，忽略子目录中的文件
+        """
+        try:
+            manifests = []
+            paginator = self.s3_client.get_paginator('list_objects_v2')
+            for page in paginator.paginate(Bucket=bucket, Prefix=prefix, Delimiter='/'):
+                for obj in page.get('Contents', []):
+                    if obj['Key'].endswith('-Manifest.json'):
+                        manifest_key = obj['Key']
+                        # 检查文件是否在当前目录下，而不是在子目录中
+                        if manifest_key.count('/') == prefix.count('/') + 1:
+                            manifests.append(manifest_key)
+            return manifests
+        except Exception as e:
+            logger.error(f"列出 Manifest 文件失败: {prefix}, 错误: {str(e)}")
+            raise
+
     def process_cur_files(self, full_sync=False, hours=24, payer_id=None, tier=None, path_filter=None):
         """处理CUR文件的主函数
         Args:
@@ -161,83 +192,135 @@ class CURParquetConverter:
         """
         accounts = self.get_payer_accounts()
         
-        # 如果指定了 payer_id，只处理该账号
+        # 如果指定了payer，只处理指定的账号
         if payer_id:
             accounts = [acc for acc in accounts if acc['aws_id'] == payer_id]
             if not accounts:
-                logger.error(f"No account found with AWS ID: {payer_id}")
+                logger.error(f"找不到 Payer Account ID: {payer_id}")
                 return
-        
-        # 计算指定小时数前的时间戳
-        if not full_sync:
-            from datetime import datetime, timedelta
-            time_threshold = (datetime.now() - timedelta(hours=hours)).timestamp()
-            
+
         for account in accounts:
             logger.info(f"处理账号: {account['name']} ({account['aws_id']})")
             
-            # 如果指定了粒度，只处理指定粒度的数据
-            granularities = [tier] if tier else ['hourly', 'daily', 'monthly']
-            for granularity in granularities:
-                # 记录是否需要更新分区
-                needs_partition_update = False
-                
-                # 列出该粒度下的所有文件
+            # 定义报告粒度
+            report_types = ['monthly', 'daily', 'hourly'] if not tier else [tier]
+
+            # 遍历所有报告粒度
+            for report_type in report_types:
+                # 构造 Manifest 文件路径
+                if path_filter:
+                    billing_period = path_filter.split('=')[1]
+                    manifest_dir = (
+                        f"{report_type}/"
+                        f"{account['aws_id']}/"
+                        f"metadata/"
+                        f"BILLING_PERIOD={billing_period}"
+                    )
+                else:
+                    manifest_dir = f"{report_type}/{account['aws_id']}/metadata"
+
+                logger.info(f"扫描 Manifest 目录: {manifest_dir}")
+
+                # 列出 metadata 目录下的所有子目录
+                manifests = []
                 paginator = self.s3_client.get_paginator('list_objects_v2')
-                prefix = f"{granularity}/{account['aws_id']}/"
                 
-                for page in paginator.paginate(Bucket=self.source_bucket, Prefix=prefix):
+                # 先获取 metadata 目录
+                metadata_response = self.s3_client.list_objects_v2(
+                    Bucket=self.source_bucket,
+                    Prefix=manifest_dir,
+                    Delimiter='/'
+                )
+                
+                # 遍历并检查 BILLING_PERIOD= 目录
+                for billing_prefix in billing_response.get('CommonPrefixes', []):
+                    prefix_path = billing_prefix.get('Prefix')
+                    logger.info(f"找到子目录: {prefix_path}")
+                    # 检查是否是 BILLING_PERIOD= 格式的目录
+                    if 'BILLING_PERIOD=' in prefix_path:
+                        manifests.append(prefix_path)
+                        logger.info(f"添加符合条件的子目录: {prefix_path}")
+            
+            if not manifests:
+                logger.warning(f"未找到子目录: {manifest_dir}")
+                continue
+            
+            # 遍历每个子目录，获取其中的 Manifest 文件
+            for manifest_dir in manifests:
+                logger.info(f"处理子目录: {manifest_dir}")
+                # 只获取子目录下的 Manifest 文件，不获取更深层的目录
+                for page in paginator.paginate(Bucket=self.source_bucket, Prefix=manifest_dir, Delimiter='/'):
                     for obj in page.get('Contents', []):
-                        source_key = obj['Key']
-                        if not source_key.endswith('.csv.gz'):
-                            continue
-                            
-                        # 如果不是全量同步，检查文件的最后修改时间
-                        if not full_sync:
-                            if obj['LastModified'].timestamp() < time_threshold:
-                                logger.debug(f"Skipping old file: {source_key} (LastModified: {obj['LastModified']})")
-                                continue
-                            
-                        # 如果指定了分区路径，检查文件是否在该分区中
-                        if path_filter and path_filter not in source_key:
-                            continue
-                            
-                        logger.info(f"Processing file: {source_key} (LastModified: {obj['LastModified']})")
+                        if obj['Key'].endswith('-Manifest.json'):
+                            manifest_key = obj['Key']
+                            # 检查文件是否在当前目录下
+                            if manifest_key.startswith(manifest_dir):
+                                logger.info(f"找到 Manifest 文件: {manifest_key}")
+                                manifests.append(manifest_key)
+            
+            if not manifests:
+                logger.warning(f"未找到 Manifest 文件: {manifest_dir}")
+                continue
 
-                        try:
-                            # 从路径中提取日期信息
-                            billing_period = next(
-                                part.split('=')[1]
-                                for part in source_key.split('/')
-                                if part.startswith('BILLING_PERIOD=')
-                            )
-                            
-                            # 使用源文件的完整路径计算MD5
-                            import hashlib
-                            file_hash = hashlib.md5(source_key.encode()).hexdigest()[-16:]
-                            # 读取并转换数据
-                            df = self._read_gzip_to_df(self.source_bucket, source_key)
-                            
-                            # 构造目标路径
-                            target_key = (
-                                f"{granularity}/"
-                                f"ID={account['aws_id']}/"
-                                f"cid-cur2/"
-                                f"data/"
-                                f"BILLING_PERIOD={billing_period}/"
-                                f"{file_hash}.parquet"
-                            )
-                            
+            for manifest_key in manifests:
+                try:
+                    # 读取 Manifest 文件
+                    manifest_content = self._read_manifest_file(self.source_bucket, manifest_key)
+                    logger.info(f"成功读取 Manifest 文件: {manifest_key}")
+                    
+                    # 获取数据文件列表
+                    data_files = manifest_content.get('dataFiles', [])
+                    logger.info(f"数据文件列表大小: {len(data_files)}")
+                    
+                    # 只处理最新的数据文件
+                    latest_data_file = max(data_files, key=lambda x: x['compression'])
+                    logger.info(f"处理最新的数据文件: {latest_data_file['key']}")
+                    
+                    # 标准化数据格式
+                    logger.info(f"标准化数据格式: {latest_data_file['key']}")
+                    df = self._standardize_cur_data(pd.read_csv(latest_data_file['key']))
+                    
+                    # 检查DataFrame是否为空
+                    if df.empty:
+                        logger.warning(f"跳过空的DataFrame: {latest_data_file['key']}")
+                        continue
 
-                            # 上传parquet文件
-                            self._upload_parquet_to_s3(df, target_key)
-                            logger.info(f"Converted {source_key} to {target_key}")
-                            needs_partition_update = True
-                            
-                        except Exception as e:
-                            logger.error(f"Error processing {source_key}: {str(e)}")
+                    # 使用源文件的完整路径计算MD5
+                    import hashlib
+                    file_hash = hashlib.md5(latest_data_file['key'].encode()).hexdigest()[-16:]
+                    
+                    # 从源文件路径中提取账单周期
+                    billing_period = None
+                    for part in latest_data_file['key'].split('/'):
+                        if part.startswith('BILLING_PERIOD='):
+                            billing_period = part.split('=')[1]
+                            break
+                    
+                    if not billing_period:
+                        logger.warning(f"无法从文件路径中提取账单周期: {latest_data_file['key']}")
+                        if path_filter and path_filter.startswith('BILLING_PERIOD='):
+                            billing_period = path_filter.split('=')[1]
+                        else:
                             continue
-                
+                    
+                    # 构造目标文件路径
+                    target_key = (
+                        f"{report_type}/"
+                        f"ID={account['aws_id']}/"
+                        f"cid-cur2/"
+                        f"data/"
+                        f"BILLING_PERIOD={billing_period}/"
+                        f"{file_hash}.parquet"
+                    )
+                    
+                    # 上传Parquet文件
+                    logger.info(f"开始上传Parquet文件: {target_key}")
+                    self._upload_parquet_to_s3(df, target_key)
+                    
+                    logger.info(f"文件处理完成: {latest_data_file['key']}")
+                except Exception as e:
+                    logger.error(f"处理数据文件失败: {manifest_key}, 错误: {str(e)}")
+
 def main():
     # 解析命令行参数
     import argparse
@@ -260,8 +343,9 @@ def main():
         parser.error("--full 和 --hour 参数不能同时使用")
         
     # 检查分区路径格式
-    if args.path and not args.path.startswith('BILLING_PERIOD='):
-        parser.error("--path 参数必须以 'BILLING_PERIOD=' 开头")
+    if args.path:
+        if not args.path.startswith('BILLING_PERIOD='):
+            parser.error("--path 参数必须以 'BILLING_PERIOD=' 开头")
 
     # 设置日志
     logging.basicConfig(

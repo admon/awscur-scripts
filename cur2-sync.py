@@ -48,19 +48,35 @@ class FileDownloader:
 
             # 计算时间阈值
             time_threshold = None if full_sync else datetime.now(timezone.utc) - timedelta(hours=hours)
-            
+
             # 根据 tier 参数决定要处理的目录
             dir_mapping = {
                 'monthly': account['monthly_dir'],
                 'daily': account['daily_dir'],
                 'hourly': account['hourly_dir']
             }
-            
+
+            # 获取要处理的目录列表
+            base_prefixes = []
             if tier:
-                prefixes = [dir_mapping[tier]] if dir_mapping[tier] else []
+                if dir_mapping[tier]:
+                    base_prefixes.append(dir_mapping[tier])
             else:
-                prefixes = [account['monthly_dir'], account['daily_dir'], account['hourly_dir']]
-            
+                for t in ['monthly', 'daily', 'hourly']:
+                    if dir_mapping[t]:
+                        base_prefixes.append(dir_mapping[t])
+
+            # 构建 data 和 metadata 目录的前缀列表
+            prefixes = []
+            for base_prefix in base_prefixes:
+                # 添加 data 目录
+                prefixes.append(base_prefix)
+                # 添加对应的 metadata 目录
+                metadata_prefix = base_prefix.replace('/data', '/metadata')
+                if metadata_prefix != base_prefix:  # 只有当实际发生替换时才添加
+                    prefixes.append(metadata_prefix)
+                    logger.info(f"Adding metadata directory: {metadata_prefix}")
+
             paginator = source_s3_client.get_paginator('list_objects_v2')
             for prefix in prefixes:
                 if not prefix:
@@ -69,30 +85,55 @@ class FileDownloader:
                     for obj in page.get('Contents', []):
                         file_key = obj['Key']
                         last_modified = obj['LastModified']
-                        
+
                         # 只处理过去24小时内修改过的文件（如果不是全量同步）
                         if time_threshold and last_modified < time_threshold:
                             continue
-                            
+
                         # 如果指定了分区路径，检查文件是否在该分区中
                         if path_filter and path_filter not in file_key:
                             continue
+
+                        # 使用数据库中的路径判断文件类型和路径
+                        current_dir = prefix  # 当前正在处理的目录
                         
-                        # 从文件路径中提取类型和其他路径信息
-                        path_parts = file_key.split('/')
-                        base_dir = path_parts[0]  # 通常是 'report'
-                        report_type = path_parts[1].split('-')[-1]  # 提取 'monthly', 'daily', 或 'hourly'
-                        remaining_path = '/'.join(path_parts[3:])  # 保留从 BILLING_PERIOD 开始的路径
+                        # 确定文件类型和报告粒度
+                        if current_dir.endswith('/data') or '/data/' in current_dir:
+                            content_type = 'data'
+                        elif current_dir.endswith('/metadata') or '/metadata/' in current_dir:
+                            content_type = 'metadata'
+                        else:
+                            # 如果路径中没有明确的 data 或 metadata 标记，默认为 data
+                            content_type = 'data'
+                            
+                        # 使用数据库中的路径判断报告粒度
+                        if tier:
+                            report_type = tier
+                        else:
+                            # 根据当前目录判断报告粒度
+                            if current_dir == account['hourly_dir'] or current_dir.replace('/data', '/metadata') == account['hourly_dir'].replace('/data', '/metadata'):
+                                report_type = 'hourly'
+                            elif current_dir == account['daily_dir'] or current_dir.replace('/data', '/metadata') == account['daily_dir'].replace('/data', '/metadata'):
+                                report_type = 'daily'
+                            elif current_dir == account['monthly_dir'] or current_dir.replace('/data', '/metadata') == account['monthly_dir'].replace('/data', '/metadata'):
+                                report_type = 'monthly'
+                            else:
+                                logger.warning(f"Cannot determine report type for directory: {current_dir}")
+                                continue
+                                
+                        # 提取剩余路径和文件名
+                        remaining_path = file_key[len(current_dir):].lstrip('/')
+                        file_name = file_key.split('/')[-1]
 
                         # 构造本地下载路径
-                        local_download_path = self.local_download_dir / f"{account['aws_id']}_{path_parts[-1]}"
+                        local_download_path = self.local_download_dir / f"{account['aws_id']}_{file_name}"
                         logger.info(f"下载文件: {file_key} -> {local_download_path}")
 
                         # 下载文件
                         source_s3_client.download_file(account['bucket'], file_key, str(local_download_path))
 
-                        # 构造S3上传路径，保持原始目录结构
-                        s3_upload_path = f"{report_type}/{account['aws_id']}/{remaining_path}"
+                        # 构造S3上传路径
+                        s3_upload_path = f"{report_type}/{account['aws_id']}/{content_type}/{remaining_path}"
                         logger.info(f"备份文件: {local_download_path} -> {s3_upload_path}")
 
                         # 使用IAM角色上传文件
@@ -139,11 +180,11 @@ def main():
     parser.add_argument('--path', type=str,
                       help='指定要同步的分区路径，例如：BILLING_PERIOD=2025-01')
     args = parser.parse_args()
-    
+
     # 检查参数冲突
     if args.full and args.hour is not None:
         parser.error("--full 和 --hour 参数不能同时使用")
-        
+
     # 检查分区路径格式
     if args.path and not args.path.startswith('BILLING_PERIOD='):
         parser.error("--path 参数必须以 'BILLING_PERIOD=' 开头")
@@ -154,20 +195,20 @@ def main():
 
     # 设置同步小时数
     hours = None if args.full else (args.hour or 24)
-    
+
     # 获取AWS账号信息
     accounts = get_payer_accounts(db_config)
-    
+
     # 如果指定了payer，只处理指定的账号
     if args.payer:
         accounts = [acc for acc in accounts if acc['aws_id'] == args.payer]
         if not accounts:
             logger.error(f"找不到 Payer Account ID: {args.payer}")
             return
-    
+
     for account in accounts:
         logger.info(f"处理账号: {account['name']} ({account['aws_id']})")
-        downloader.download_files(account, args.full, args.hour, args.tier, args.path)
+        downloader.download_files(account, args.full, hours, args.tier, args.path)
 
 if __name__ == "__main__":
     main()
