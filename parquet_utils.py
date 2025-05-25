@@ -10,17 +10,19 @@ import io
 import json
 import logging
 import tempfile
+import os
 from typing import Dict, List, Optional, Set, Union
 
 import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
 
 # 配置日志
 logger = logging.getLogger(__name__)
 
 class ParquetConverter:
-    """处理文件格式转换"""
+    """处理文件格式转换
+    使用简单直接的方法处理CSV到Parquet的转换
+    特别关注时间字段和Map字段的正确处理
+    """
     # 定义需要强制为字符串类型的字段
     STRING_COLUMNS = {
         'line_item_usage_account_id',
@@ -32,7 +34,6 @@ class ParquetConverter:
         'product_product_family',
         'line_item_usage_type',
         'pricing_term',
-        # 添加其他应该被视为字符串的字段
         'product_from_account_id',
         'product_to_account_id',
         'pricing_plan_arn',
@@ -46,6 +47,14 @@ class ParquetConverter:
         'line_item_usage_end_date',
         'bill_billing_period_start_date',
         'bill_billing_period_end_date'
+    ]
+    
+    # Map字段列表
+    MAP_FIELDS = [
+        'cost_category',
+        'discount',
+        'product',
+        'resource_tags'
     ]
     
     def __init__(self, memory_threshold_mb: int = 200):
@@ -66,89 +75,43 @@ class ParquetConverter:
             Parquet格式的字节内容，失败时返回None
         """
         try:
-            # 使用BytesIO直接在内存中处理小文件
-            if len(csv_content) < self.memory_threshold:  # 小于阈值的文件直接在内存中处理
-                logger.debug(f"使用内存处理CSV文件，大小: {len(csv_content)/1024/1024:.2f}MB")
-                return self._process_in_memory(csv_content)
-            else:
-                logger.debug(f"使用临时文件处理CSV文件，大小: {len(csv_content)/1024/1024:.2f}MB")
-                return self._process_with_temp_file(csv_content)
-        except Exception as e:
-            logger.error(f"CSV转Parquet失败: {str(e)}")
-            return None
-    
-    def _process_in_memory(self, csv_content: bytes) -> Optional[bytes]:
-        """在内存中处理CSV到Parquet的转换
-        
-        Args:
-            csv_content: CSV文件内容
-            
-        Returns:
-            Parquet格式的字节内容
-        """
-        try:
-            # 使用BytesIO在内存中处理
-            with io.BytesIO(csv_content) as csv_buffer:
-                # 读取CSV为DataFrame
-                df = pd.read_csv(csv_buffer, compression='gzip', low_memory=False)
-                
-                # 处理数据类型
-                df = self._process_data_types(df)
-                
-                # 转换为Parquet并直接返回字节
-                parquet_buffer = io.BytesIO()
-                # 创建Schema，显式指定时间字段的类型
-                schema = self._create_parquet_schema(df)
-                table = pa.Table.from_pandas(df, schema=schema)
-                
-                # 直接使用PyArrow写入文件
-                pq.write_table(
-                    table,
-                    parquet_buffer,
-                    compression='snappy'
-                )
-                return parquet_buffer.getvalue()
-        except Exception as e:
-            logger.error(f"内存中处理CSV失败: {str(e)}")
-            return None
-    
-    def _process_with_temp_file(self, csv_content: bytes) -> Optional[bytes]:
-        """使用临时文件处理CSV到Parquet的转换
-        
-        Args:
-            csv_content: CSV文件内容
-            
-        Returns:
-            Parquet格式的字节内容
-        """
-        try:
-            # 大文件使用临时文件处理
-            with tempfile.NamedTemporaryFile(suffix='.csv.gz') as csv_tmp:
+            # 使用临时文件处理
+            with tempfile.NamedTemporaryFile(suffix='.csv.gz', delete=False) as csv_tmp:
+                csv_path = csv_tmp.name
                 csv_tmp.write(csv_content)
                 csv_tmp.flush()
-                
+            
+            # 创建临时输出文件
+            with tempfile.NamedTemporaryFile(suffix='.parquet', delete=False) as parquet_tmp:
+                parquet_path = parquet_tmp.name
+            
+            try:
                 # 读取CSV为DataFrame
-                df = pd.read_csv(csv_tmp.name, compression='gzip', low_memory=False)
+                df = pd.read_csv(csv_path, compression='gzip', low_memory=False)
                 
                 # 处理数据类型
                 df = self._process_data_types(df)
                 
-                # 转换为Parquet
-                with tempfile.NamedTemporaryFile(suffix='.parquet') as parquet_tmp:
-                    # 创建Schema，显式指定时间字段的类型
-                    schema = self._create_parquet_schema(df)
-                    table = pa.Table.from_pandas(df, schema=schema)
-                    
-                    # 直接使用PyArrow写入文件
-                    pq.write_table(
-                        table,
-                        parquet_tmp.name,
-                        compression='snappy'
-                    )
-                    with open(parquet_tmp.name, 'rb') as f:
-                        return f.read()
+                # 直接使用pandas保存为Parquet格式
+                df.to_parquet(parquet_path, index=False)
+                
+                # 读取生成的Parquet文件
+                with open(parquet_path, 'rb') as f:
+                    parquet_content = f.read()
+                
+                return parquet_content
+            
+            finally:
+                # 清理临时文件
+                for path in [csv_path, parquet_path]:
+                    if os.path.exists(path):
+                        try:
+                            os.unlink(path)
+                        except Exception as e:
+                            logger.warning(f"清理临时文件失败: {path}, 错误: {str(e)}")
+        
         except Exception as e:
-            logger.error(f"使用临时文件处理CSV失败: {str(e)}")
+            logger.error(f"CSV转Parquet失败: {str(e)}")
             return None
     
     def _process_data_types(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -166,7 +129,7 @@ class ParquetConverter:
                 df[col] = df[col].fillna('').astype(str)
                 logger.debug(f"将字段 {col} 转换为字符串类型")
         
-        # 处理时间字段
+        # 处理时间字段 - 关键是转换为正确的格式
         for col in self.TIME_FIELDS:
             if col in df.columns:
                 try:
@@ -175,136 +138,76 @@ class ParquetConverter:
                     # 移除时区信息
                     if df[col].dt.tz is not None:
                         df[col] = df[col].dt.tz_localize(None)
-                    # 不转换为字符串，保持timestamp类型
-                    # 注意：这里不再转换为字符串，而是保持datetime类型
-                    logger.debug(f"将字段 {col} 保持为timestamp类型")
+                    # 将datetime转换为指定格式的字符串
+                    df[col] = df[col].dt.strftime('%Y-%m-%d %H:%M:%S.%f').str[:-3]
+                    logger.debug(f"将字段 {col} 转换为格式化字符串: {df[col].iloc[0] if not df[col].empty else ''}")
                 except Exception as e:
-                    logger.error(f"Failed to convert {col}: {str(e)}")
+                    logger.error(f"转换时间字段失败 {col}: {str(e)}")
         
-        # 检查是否有 NaT 值
-        for col in self.TIME_FIELDS:
-            if col in df.columns:
-                nat_count = df[col].isna().sum()
-                if nat_count > 0:
-                    logger.warning(f"Found {nat_count} NaT values in {col}")
-        
-        # 处理账号相关的字段，确保它们是字符串类型
-        account_id_fields = [
-            'bill_payer_account_id',
-            'line_item_usage_account_id',
-            'product_from_account_id',
-            'product_to_account_id',
-            'pricing_plan_arn',
-            'resource_id'
-        ]
-        for col in account_id_fields:
-            if col in df.columns:
-                # 先将空值替换为空字符串，再转换为字符串类型
-                df[col] = df[col].fillna('').astype(str)
-        
-        # 处理Map类型字段
-        map_fields = [
-            'cost_category',
-            'discount',
-            'product',
-            'resource_tags'
-        ]
-        
-        for field in map_fields:
+        # 处理Map字段 - 尝试保持正确的JSON格式
+        for field in self.MAP_FIELDS:
             if field in df.columns:
-                logger.debug(f"处理Map字段: {field}")
-                df[field] = df[field].apply(lambda x: parse_json_or_default(x))
+                try:
+                    # 先将空值替换为空字典字符串
+                    df[field] = df[field].fillna('{}')
+                    
+                    # 尝试确保每个值都是有效的JSON字符串
+                    def ensure_json_string(val):
+                        if pd.isna(val) or val == '':
+                            return '{}'
+                        
+                        # 如果已经是字典对象，转换为JSON字符串
+                        if isinstance(val, dict):
+                            return json.dumps(val)
+                            
+                        # 如果是字符串，尝试解析并重新格式化
+                        if isinstance(val, str):
+                            try:
+                                # 如果已经是JSON字符串，解析并重新格式化
+                                if val.strip() and val.strip()[0] == '{':
+                                    return json.dumps(json.loads(val))
+                                else:
+                                    # 不是JSON对象，创建一个包含原始值的字典
+                                    return json.dumps({'value': val})
+                            except:
+                                # 解析失败，创建一个包含原始值的字典
+                                return json.dumps({'value': val})
+                        
+                        # 其他类型，创建一个包含原始值的字典
+                        return json.dumps({'value': str(val)})
+                    
+                    # 应用到每一行
+                    df[field] = df[field].apply(ensure_json_string)
+                    
+                    logger.debug(f"将字段 {field} 转换为JSON字符串: {df[field].iloc[0] if not df[field].empty else '{}'}")
+                    
+                except Exception as e:
+                    logger.error(f"转换Map字段失败 {field}: {str(e)}")
+                    # 如果转换失败，将其设置为空JSON对象
+                    df[field] = df[field].apply(lambda x: '{}' if pd.isna(x) or x == '' else str(x))
         
         return df
-        
-    def _create_parquet_schema(self, df: pd.DataFrame) -> pa.Schema:
-        """创建Parquet Schema，正确处理特殊类型字段
-        
-        Args:
-            df: 输入的DataFrame
-            
-        Returns:
-            PyArrow Schema对象
-        """
-        # 创建字段列表
-        fields = []
-        
-        # 处理所有列
-        for col_name in df.columns:
-            # 时间字段使用timestamp类型
-            if col_name in self.TIME_FIELDS:
-                fields.append(pa.field(col_name, pa.timestamp('ns')))
-            
-            # Map类型字段
-            elif col_name == 'cost_category':
-                fields.append(pa.field(col_name, pa.map_(pa.string(), pa.string())))
-            elif col_name == 'discount':
-                fields.append(pa.field(col_name, pa.map_(pa.string(), pa.float64())))
-            elif col_name == 'product':
-                fields.append(pa.field(col_name, pa.map_(pa.string(), pa.string())))
-            elif col_name == 'resource_tags':
-                fields.append(pa.field(col_name, pa.map_(pa.string(), pa.string())))
-            
-            # 字符串类型字段
-            elif col_name in self.STRING_COLUMNS:
-                fields.append(pa.field(col_name, pa.string()))
-            
-            # 其他字段使用自动推断类型
-            else:
-                # 获取pandas列的类型
-                dtype = df[col_name].dtype
-                
-                # 根据pandas类型选择PyArrow类型
-                if pd.api.types.is_integer_dtype(dtype):
-                    fields.append(pa.field(col_name, pa.int64()))
-                elif pd.api.types.is_float_dtype(dtype):
-                    fields.append(pa.field(col_name, pa.float64()))
-                elif pd.api.types.is_bool_dtype(dtype):
-                    fields.append(pa.field(col_name, pa.bool_()))
-                else:
-                    # 默认使用字符串类型
-                    fields.append(pa.field(col_name, pa.string()))
-        
-        return pa.schema(fields)
-
 
 def parse_json_or_default(value):
     """解析JSON字符串，如果失败则返回默认值
     
     Args:
         value: 要解析的JSON字符串
-        
+                
     Returns:
         解析后的字典，或者默认值
     """
     if pd.isna(value) or value == '':
         return {'_empty': ''}
-    
+        
     try:
         # 如果已经是字典类型，直接返回
         if isinstance(value, dict):
             return value if value else {'_empty': ''}
-            
+                
         # 尝试解析JSON字符串
         result = json.loads(value)
-        
-        # 确保结果是字典类型
-        if not isinstance(result, dict):
-            return {'_value': str(result)}
-            
-        # 确保字典不为空
-        if not result:
-            return {'_empty': ''}
-            
-        # 对于discount字段，确保值是浮点数
-        for k, v in result.items():
-            if isinstance(v, str) and v.replace('.', '', 1).isdigit():
-                try:
-                    result[k] = float(v)
-                except:
-                    pass
-                    
-        return result
-    except Exception as e:
-        logger.debug(f"JSON解析失败: {str(e)}, 值: {value}")
-        return {'_error': str(value)}
+        return result if result else {'_empty': ''}
+    except Exception:
+        # 解析失败，返回包含原始值的字典
+        return {'value': str(value)}

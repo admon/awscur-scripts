@@ -13,8 +13,6 @@ import boto3
 import botocore
 import mysql.connector
 import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
 from dotenv import load_dotenv
 
 # 导入自定义模块
@@ -412,15 +410,36 @@ class CURParquetConverter:
         
     def _update_processed_manifest(self, account_id: str, manifest_path: str, 
                                 report_type: str, manifest_last_modified: datetime,
-                                status: str, error_message: Optional[str] = None):
-        """更新 Manifest 处理状态"""
+                                status: str, error_message: Optional[str] = None,
+                                expected_files: Optional[List[str]] = None):
+        """更新 Manifest 处理状态
+        
+        Args:
+            account_id: 账号ID
+            manifest_path: Manifest文件路径
+            report_type: 报告类型
+            manifest_last_modified: Manifest文件最后修改时间
+            status: 处理状态
+            error_message: 错误信息
+            expected_files: 预期的Parquet文件名列表
+        """
+        # 将expected_files列表转换为JSON字符串
+        expected_files_json = '[]'
+        if expected_files:
+            try:
+                expected_files_json = json.dumps(expected_files)
+                logger.debug(f"预期文件列表: {expected_files_json}")
+            except Exception as e:
+                logger.error(f"转换expected_files为JSON失败: {str(e)}")
+                
         return self.db_handler.update_processed_manifest(
             account_id=account_id,
             manifest_path=manifest_path,
             report_type=report_type,
             manifest_last_modified=manifest_last_modified,
             status=status,
-            error_message=error_message
+            error_message=error_message,
+            expected_files=expected_files_json
         )
     
     def _get_s3_client(self, account):
@@ -667,7 +686,9 @@ class CURParquetConverter:
                 manifest_path,
                 report_type,
                 manifest_last_modified,
-                'success' if success else 'error'
+                'success' if success else 'error',
+                None,  # error_message
+                expected_files  # 传递预期文件列表
             )
             
             return success
