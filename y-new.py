@@ -228,14 +228,24 @@ class DBHandler:
         if 'aws_account_id' in kwargs:
             kwargs['account_id'] = kwargs.pop('aws_account_id')
             
-        # 从 manifest_path 提取 manifest_partition
-        manifest_path = kwargs.get('manifest_path', '')
-        partition_match = re.search(r'BILLING_PERIOD=[^/]+', manifest_path)
-        if partition_match:
-            kwargs['manifest_partition'] = partition_match.group(0)
+        # 如果没有传递manifest_partition参数，则从 manifest_path 提取
+        logger.info(f"DBHandler.update_processed_manifest 输入参数: {kwargs}")
+        if 'manifest_partition' not in kwargs or not kwargs['manifest_partition']:
+            manifest_path = kwargs.get('manifest_path', '')
+            logger.info(f"manifest_path: {manifest_path}")
+            partition_match = re.search(r'BILLING_PERIOD=([^/]+)', manifest_path)
+            if partition_match:
+                # 提取YYYY-MM格式的账期
+                billing_period = partition_match.group(1)
+                kwargs['manifest_partition'] = billing_period
+                logger.info(f"从路径提取的账期: {billing_period}")
+            else:
+                logger.error(f"无法从 manifest_path 提取 manifest_partition: {manifest_path}")
+                return False
         else:
-            logger.error(f"无法从 manifest_path 提取 manifest_partition: {manifest_path}")
-            return False
+            logger.info(f"使用传递的账期: {kwargs['manifest_partition']}")
+        
+        logger.info(f"DBHandler.update_processed_manifest 最终参数: {kwargs}")
             
         # 添加当前时间作为 processed_at
         kwargs['processed_at'] = datetime.now()
@@ -268,6 +278,10 @@ class DBHandler:
             logger.error(f"expected_files 类型无效: {type(kwargs['expected_files'])}")
             return False
         
+        # 在执行SQL之前记录参数
+        logger.info(f"执行SQL前的参数: {kwargs}")
+        logger.info(f"manifest_partition值: {kwargs.get('manifest_partition')}")
+        
         sql = """
         INSERT INTO processedfiles
             (account_id, manifest_path, manifest_partition, report_type, manifest_last_modified, status, error_message, processed_at, expected_files)
@@ -278,10 +292,12 @@ class DBHandler:
             error_message = VALUES(error_message),
             processed_at = VALUES(processed_at),
             manifest_last_modified = VALUES(manifest_last_modified),
+            manifest_partition = VALUES(manifest_partition),
             expected_files = VALUES(expected_files),
             updated_at = CURRENT_TIMESTAMP
         """
         try:
+            logger.info(f"执行SQL: {sql}")
             self.cursor.execute(sql, kwargs)
             self.db.commit()
             return True
@@ -411,7 +427,8 @@ class CURParquetConverter:
     def _update_processed_manifest(self, account_id: str, manifest_path: str, 
                                 report_type: str, manifest_last_modified: datetime,
                                 status: str, error_message: Optional[str] = None,
-                                expected_files: Optional[List[str]] = None):
+                                expected_files: Optional[List[str]] = None,
+                                manifest_partition: Optional[str] = None):
         """更新 Manifest 处理状态
         
         Args:
@@ -422,7 +439,18 @@ class CURParquetConverter:
             status: 处理状态
             error_message: 错误信息
             expected_files: 预期的Parquet文件名列表
+            manifest_partition: 账期信息，格式为'YYYY-MM'
         """
+        logger.info(f"_update_processed_manifest 调用参数: account_id={account_id}, manifest_path={manifest_path}, report_type={report_type}, status={status}, manifest_partition={manifest_partition}")
+        
+        # 如果没有提供账期信息，尝试从路径中提取
+        if not manifest_partition and manifest_path:
+            try:
+                manifest_partition = self._extract_partition(manifest_path)
+                logger.info(f"_update_processed_manifest 从路径提取的账期: {manifest_partition}")
+            except Exception as e:
+                logger.error(f"_update_processed_manifest 无法从路径提取账期: {str(e)}")
+        
         # 将expected_files列表转换为JSON字符串
         expected_files_json = '[]'
         if expected_files:
@@ -431,6 +459,8 @@ class CURParquetConverter:
                 logger.debug(f"预期文件列表: {expected_files_json}")
             except Exception as e:
                 logger.error(f"转换expected_files为JSON失败: {str(e)}")
+        
+        logger.info(f"_update_processed_manifest 调用db_handler.update_processed_manifest的参数: account_id={account_id}, manifest_path={manifest_path}, report_type={report_type}, status={status}, manifest_partition={manifest_partition}")
                 
         return self.db_handler.update_processed_manifest(
             account_id=account_id,
@@ -439,7 +469,8 @@ class CURParquetConverter:
             manifest_last_modified=manifest_last_modified,
             status=status,
             error_message=error_message,
-            expected_files=expected_files_json
+            expected_files=expected_files_json,
+            manifest_partition=manifest_partition
         )
     
     def _get_s3_client(self, account):
@@ -688,7 +719,8 @@ class CURParquetConverter:
                 manifest_last_modified,
                 'success' if success else 'error',
                 None,  # error_message
-                expected_files  # 传递预期文件列表
+                expected_files,  # 传递预期文件列表
+                partition  # 传递账期信息
             )
             
             return success
