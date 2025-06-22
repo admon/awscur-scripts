@@ -14,6 +14,8 @@ import os
 from typing import Dict, List, Optional, Set, Union
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 # 配置日志
 logger = logging.getLogger(__name__)
@@ -92,8 +94,45 @@ class ParquetConverter:
                 # 处理数据类型
                 df = self._process_data_types(df)
                 
-                # 直接使用pandas保存为Parquet格式
-                df.to_parquet(parquet_path, index=False)
+                # 创建Parquet Schema，明确指定时间字段为timestamp类型
+                fields = []
+                for col in df.columns:
+                    if col in self.TIME_FIELDS:
+                        # 时间字段使用timestamp类型，指定为毫秒精度(timestamp(3))
+                        fields.append(pa.field(col, pa.timestamp('ms')))
+                        logger.info(f"将字段 {col} 设置为timestamp('ms')类型，匹配表定义中的timestamp(3)")
+                    elif col in self.MAP_FIELDS:
+                        # Map字段使用字符串类型
+                        fields.append(pa.field(col, pa.string()))
+                        logger.debug(f"将字段 {col} 设置为字符串类型")
+                    elif col in self.STRING_COLUMNS:
+                        # 字符串字段
+                        fields.append(pa.field(col, pa.string()))
+                    elif pd.api.types.is_float_dtype(df[col].dtype):
+                        # 浮点数字段
+                        fields.append(pa.field(col, pa.float64()))
+                    elif pd.api.types.is_integer_dtype(df[col].dtype):
+                        # 整数字段
+                        fields.append(pa.field(col, pa.int64()))
+                    else:
+                        # 其他字段默认为字符串
+                        fields.append(pa.field(col, pa.string()))
+                
+                schema = pa.schema(fields)
+                
+                # 使用PyArrow写入Parquet文件，加入更多配置以提高兼容性
+                table = pa.Table.from_pandas(df, schema=schema)
+                
+                # 写入配置
+                write_options = {
+                    'compression': 'snappy',                # 使用snappy压缩，这是标准的Parquet压缩方式
+                    'version': '2.0',                      # 使用Parquet 2.0格式，提高兼容性
+                    'write_statistics': True,              # 写入统计信息，有助于查询优化
+                    'coerce_timestamps': 'ms',             # 强制时间戳为毫秒精度，匹配表定义中的timestamp(3)
+                }
+                
+                pq.write_table(table, parquet_path, **write_options)
+                logger.info(f"使用PyArrow写入Parquet文件，指定时间字段为timestamp('ms')类型，匹配表定义中的timestamp(3)")
                 
                 # 读取生成的Parquet文件
                 with open(parquet_path, 'rb') as f:
@@ -129,7 +168,7 @@ class ParquetConverter:
                 df[col] = df[col].fillna('').astype(str)
                 logger.debug(f"将字段 {col} 转换为字符串类型")
         
-        # 处理时间字段 - 关键是转换为正确的格式
+        # 处理时间字段 - 确保它们在Parquet文件中被正确存储为timestamp类型
         for col in self.TIME_FIELDS:
             if col in df.columns:
                 try:
@@ -138,52 +177,75 @@ class ParquetConverter:
                     # 移除时区信息
                     if df[col].dt.tz is not None:
                         df[col] = df[col].dt.tz_localize(None)
-                    # 将datetime转换为指定格式的字符串
-                    df[col] = df[col].dt.strftime('%Y-%m-%d %H:%M:%S.%f').str[:-3]
-                    logger.debug(f"将字段 {col} 转换为格式化字符串: {df[col].iloc[0] if not df[col].empty else ''}")
+                    
+                    # 将datetime转换为标准格式的字符串，这样可以确保它们被正确解析
+                    # 使用ISO 8601格式，这是最标准的时间格式
+                    df[col] = df[col].dt.strftime('%Y-%m-%dT%H:%M:%S.%f').str[:-3]
+                    logger.info(f"将字段 {col} 转换为ISO 8601格式的字符串: {df[col].iloc[0] if not df[col].empty else ''}")
                 except Exception as e:
                     logger.error(f"转换时间字段失败 {col}: {str(e)}")
         
-        # 处理Map字段 - 尝试保持正确的JSON格式
+        # 处理Map字段 - 保持JSON格式，但确保与Hive表的schema定义兼容
         for field in self.MAP_FIELDS:
             if field in df.columns:
                 try:
                     # 先将空值替换为空字典字符串
                     df[field] = df[field].fillna('{}')
                     
-                    # 尝试确保每个值都是有效的JSON字符串
-                    def ensure_json_string(val):
+                    # 确保每个值都是有效的JSON字符串，但不使用结构体
+                    def ensure_valid_json_map(val):
                         if pd.isna(val) or val == '':
                             return '{}'
                         
                         # 如果已经是字典对象，转换为JSON字符串
                         if isinstance(val, dict):
-                            return json.dumps(val)
-                            
-                        # 如果是字符串，尝试解析并重新格式化
+                            # 对discount字段进行特殊处理，确保值是数值类型
+                            if field == 'discount':
+                                try:
+                                    # 尝试将值转换为浮点数
+                                    return json.dumps({str(k): float(v) for k, v in val.items()})
+                                except (ValueError, TypeError):
+                                    # 如果转换失败，保持原样
+                                    return json.dumps({str(k): str(v) for k, v in val.items()})
+                            else:
+                                # 其他Map字段，确保所有键和值都是字符串
+                                return json.dumps({str(k): str(v) for k, v in val.items()})
+                        
+                        # 如果是字符串，尝试解析为JSON
                         if isinstance(val, str):
                             try:
-                                # 如果已经是JSON字符串，解析并重新格式化
+                                # 如果是JSON字符串，解析并重新格式化
                                 if val.strip() and val.strip()[0] == '{':
-                                    return json.dumps(json.loads(val))
+                                    parsed = json.loads(val)
+                                    # 对discount字段进行特殊处理
+                                    if field == 'discount':
+                                        try:
+                                            # 尝试将值转换为浮点数
+                                            return json.dumps({str(k): float(v) for k, v in parsed.items()})
+                                        except (ValueError, TypeError):
+                                            # 如果转换失败，保持原样
+                                            return json.dumps({str(k): str(v) for k, v in parsed.items()})
+                                    else:
+                                        # 其他Map字段，确保所有键和值都是字符串
+                                        return json.dumps({str(k): str(v) for k, v in parsed.items()})
                                 else:
-                                    # 不是JSON对象，创建一个包含原始值的字典
-                                    return json.dumps({'value': val})
+                                    # 如果不是JSON对象，直接返回原始字符串
+                                    return val
                             except:
-                                # 解析失败，创建一个包含原始值的字典
-                                return json.dumps({'value': val})
+                                # 解析失败，返回原始字符串
+                                return val
                         
-                        # 其他类型，创建一个包含原始值的字典
-                        return json.dumps({'value': str(val)})
+                        # 其他类型，转换为字符串
+                        return str(val)
                     
                     # 应用到每一行
-                    df[field] = df[field].apply(ensure_json_string)
+                    df[field] = df[field].apply(ensure_valid_json_map)
                     
                     logger.debug(f"将字段 {field} 转换为JSON字符串: {df[field].iloc[0] if not df[field].empty else '{}'}")
                     
                 except Exception as e:
                     logger.error(f"转换Map字段失败 {field}: {str(e)}")
-                    # 如果转换失败，将其设置为空JSON对象
+                    # 如果转换失败，将其设置为空字典字符串
                     df[field] = df[field].apply(lambda x: '{}' if pd.isna(x) or x == '' else str(x))
         
         return df
