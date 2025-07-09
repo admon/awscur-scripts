@@ -13,6 +13,7 @@ def read_cur_file(file_path):
     print(f"Reading CUR file: {file_path}")
     with gzip.open(file_path, 'rt') as f:
         df = pd.read_csv(f, low_memory=False)
+    print("Columns in file:", df.columns.tolist())  # <-- Debug print
     return df
 
 def process_single_file(file_path):
@@ -23,7 +24,15 @@ def process_single_file(file_path):
         print(f"Error processing file {file_path}: {str(e)}")
         return None
 
-def analyze_ri_savings(df):
+def process_single_file_with_ri(file_path, ri_id_set):
+    try:
+        df = read_cur_file(file_path)
+        return analyze_ri_savings(df, ri_id_set=ri_id_set)
+    except Exception as e:
+        print(f"Error processing file {file_path}: {str(e)}")
+        return None
+
+def analyze_ri_savings(df, ri_id_set=None):
     # Column name candidates
     line_item_type_cols = [
         'line_item_line_item_type', 'lineItem/LineItemType', 'LineItemType', 'lineItemType'
@@ -43,11 +52,17 @@ def analyze_ri_savings(df):
     usage_amount_cols = [
         'line_item_usage_amount', 'lineItem/UsageAmount', 'UsageAmount', 'usageAmount'
     ]
-    unblended_cost_cols = [
-        'line_item_unblended_cost', 'lineItem/UnblendedCost', 'UnblendedCost', 'unblendedCost'
+    public_ondemand_cost_cols = [
+        'pricing_public_on_demand_cost', 'pricing/PublicOnDemandCost', 'PublicOnDemandCost', 'publicOnDemandCost',
+        # Add your actual column name here after checking the debug output
+        # e.g. 'lineItem/PublicOnDemandCost'
     ]
     ri_effective_cost_cols = [
         'reservation_effective_cost', 'reservation/EffectiveCost', 'EffectiveCost', 'effectiveCost'
+    ]
+    rifee_cost_cols = [
+        'reservation_recurring_fee_for_usage', # <-- Added based on your columns
+        'line_item_unblended_cost', 'lineItem/UnblendedCost', 'UnblendedCost', 'unblendedCost'
     ]
     usage_start_date_cols = [
         'line_item_usage_start_date', 'lineItem/UsageStartDate', 'UsageStartDate', 'usageStartDate'
@@ -60,8 +75,9 @@ def analyze_ri_savings(df):
     bill_payer_col = next((col for col in bill_payer_cols if col in df.columns), None)
     usage_account_col = next((col for col in usage_account_cols if col in df.columns), None)
     usage_amount_col = next((col for col in usage_amount_cols if col in df.columns), None)
-    unblended_cost_col = next((col for col in unblended_cost_cols if col in df.columns), None)
+    public_ondemand_cost_col = next((col for col in public_ondemand_cost_cols if col in df.columns), None)
     ri_effective_cost_col = next((col for col in ri_effective_cost_cols if col in df.columns), None)
+    rifee_cost_col = next((col for col in rifee_cost_cols if col in df.columns), None)
     usage_start_date_col = next((col for col in usage_start_date_cols if col in df.columns), None)
 
     missing_cols = []
@@ -72,8 +88,9 @@ def analyze_ri_savings(df):
         ('PayerAccountId', bill_payer_col),
         ('UsageAccountId', usage_account_col),
         ('UsageAmount', usage_amount_col),
-        ('UnblendedCost', unblended_cost_col),
+        ('PublicOnDemandCost', public_ondemand_cost_col),
         ('EffectiveCost', ri_effective_cost_col),
+        ('RIFeeCost', rifee_cost_col),
         ('UsageStartDate', usage_start_date_col)
     ]:
         if col is None:
@@ -81,52 +98,49 @@ def analyze_ri_savings(df):
     if missing_cols:
         raise ValueError(f"Missing required columns: {', '.join(missing_cols)}")
 
+    # Warn if public on-demand cost column is all zeros
+    if public_ondemand_cost_col and df[public_ondemand_cost_col].sum() == 0:
+        print(f"Warning: The public on-demand cost column '{public_ondemand_cost_col}' is all zeros. Please check if this is correct.")
+
     # Convert usage start date to datetime with UTC timezone
     df[usage_start_date_col] = pd.to_datetime(df[usage_start_date_col])
 
     # Filter for May 2025 (using UTC timezone)
-    may_start = pd.Timestamp('2025-05-01', tz=UTC)
-    may_end = pd.Timestamp('2025-05-30 23:59:59.999999', tz=UTC)
+    may_start = pd.Timestamp('2025-06-01', tz=UTC)
+    may_end = pd.Timestamp('2025-06-30 23:59:59.999999', tz=UTC)
     df = df[(df[usage_start_date_col] >= may_start) & (df[usage_start_date_col] <= may_end)]
 
-    # Use DiscountedUsage as RI covered usage (AWS CUR new style)
-    ri_df = df[df[line_item_type_col] == 'DiscountedUsage']
-    # Only keep rows with a valid RI subscription ID
-    ri_df = ri_df[ri_df[ri_subscription_id_col].notnull()]
+    # Filter by RI IDs if provided
+    if ri_id_set is not None:
+        # Only keep rows where the RI ID (e.g. ri-2025-05-23-11-40-46-977) is in reservation_reservation_a_r_n
+        df = df[df[ri_arn_col].apply(lambda x: any(ri_id in str(x) for ri_id in ri_id_set))]
 
-    # Group by RI subscription ID, ARN, payer account, and usage account
-    results = ri_df.groupby([ri_subscription_id_col, ri_arn_col, bill_payer_col, usage_account_col]).agg({
-        usage_amount_col: 'sum',
-        unblended_cost_col: 'sum',
+    # DiscountedUsage: RI分摊用量
+    du_df = df[df[line_item_type_col] == 'DiscountedUsage']
+    du_df = du_df[du_df[ri_subscription_id_col].notnull()]
+    du_grouped = du_df.groupby([ri_subscription_id_col, ri_arn_col, usage_account_col]).agg({
+        public_ondemand_cost_col: 'sum',
         ri_effective_cost_col: 'sum'
     }).reset_index()
-
-    # Calculate savings
-    results['Savings'] = results[unblended_cost_col] - results[ri_effective_cost_col]
-
-    # Rename columns for clarity
-    results.columns = [
+    du_grouped.columns = [
         'reservation_subscription_id',
         'reservation_reservation_a_r_n',
-        'RI Purchaser Account ID',
         'Usage Account ID',
-        'Usage Amount',
         'On-Demand Cost',
-        'RI Effective Cost',
-        'Savings'
+        'RI Effective Cost'
     ]
-    return results
+
+    # 计算节省
+    du_grouped['Savings'] = du_grouped['On-Demand Cost'] - du_grouped['RI Effective Cost']
+
+    return du_grouped
 
 def generate_detailed_csv(results, output_file):
-    # Create the final dataframe with detailed records
     final_df = results.copy()
-    # Add grand total row
     grand_total = {
         'reservation_subscription_id': 'GRAND TOTAL',
         'reservation_reservation_a_r_n': '',
-        'RI Purchaser Account ID': '',
         'Usage Account ID': '',
-        'Usage Amount': final_df['Usage Amount'].sum(),
         'On-Demand Cost': final_df['On-Demand Cost'].sum(),
         'RI Effective Cost': final_df['RI Effective Cost'].sum(),
         'Savings': final_df['Savings'].sum()
@@ -135,11 +149,11 @@ def generate_detailed_csv(results, output_file):
         final_df,
         pd.DataFrame([grand_total])
     ], ignore_index=True)
-    # Format numbers
-    final_df['Usage Amount'] = final_df['Usage Amount'].map('{:.2f}'.format)
     final_df['On-Demand Cost'] = final_df['On-Demand Cost'].map('${:.2f}'.format)
     final_df['RI Effective Cost'] = final_df['RI Effective Cost'].map('${:.2f}'.format)
     final_df['Savings'] = final_df['Savings'].map('${:.2f}'.format)
+    # Remove 'reservation_subscription_id' from output
+    final_df = final_df.drop(columns=['reservation_subscription_id'])
     final_df.to_csv(output_file, index=False)
     print(f"\nDetailed CSV report saved to: {output_file}")
 
@@ -157,7 +171,7 @@ def find_cur_files():
     return cur_files
 
 def main():
-    parser = argparse.ArgumentParser(description='Analyze AWS CUR data for RI savings')
+    parser = argparse.ArgumentParser(description='Analyze AWS CUR data for RI savings (precise)')
     parser.add_argument('--output', help='Output file path (default: ri_savings_analysis_may_2025.csv)')
     parser.add_argument('--processes', type=int, default=mp.cpu_count(), help='Number of processes to use (default: number of CPU cores)')
     args = parser.parse_args()
@@ -165,23 +179,32 @@ def main():
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         args.output = f'ri_savings_analysis_may_2025_{timestamp}.csv'
     cur_files = find_cur_files()
+
+    # Read RI IDs from file 'ri-id'
+    if os.path.exists('ri-id'):
+        with open('ri-id', 'r') as f:
+            ri_id_set = set(line.strip() for line in f if line.strip())
+        print(f"Loaded {len(ri_id_set)} RI IDs from ri-id file.")
+    else:
+        print("ri-id file not found. Will not filter by RI IDs.")
+        ri_id_set = None
+
     start_time = time.time()
     print(f"\nProcessing {len(cur_files)} files using {args.processes} processes...")
     with mp.Pool(processes=args.processes) as pool:
-        results = pool.map(process_single_file, cur_files)
+        results = pool.map(partial(process_single_file_with_ri, ri_id_set=ri_id_set), cur_files)
     results = [r for r in results if r is not None]
     if not results:
         raise ValueError("No valid results found after processing files")
     combined_results = pd.concat(results, ignore_index=True)
-    # Aggregate by reservation_subscription_id, ARN, RI Purchaser Account ID, and Usage Account ID
-    print("\nAggregating results by reservation_subscription_id, reservation_reservation_a_r_n, RI Purchaser Account ID, and Usage Account ID...")
-    combined_results = combined_results.groupby(['reservation_subscription_id', 'reservation_reservation_a_r_n', 'RI Purchaser Account ID', 'Usage Account ID']).agg({
-        'Usage Amount': 'sum',
+    # Aggregate by reservation_subscription_id, ARN, Usage Account ID
+    print("\nAggregating results by reservation_subscription_id, reservation_reservation_a_r_n, Usage Account ID...")
+    combined_results = combined_results.groupby(['reservation_subscription_id', 'reservation_reservation_a_r_n', 'Usage Account ID']).agg({
         'On-Demand Cost': 'sum',
         'RI Effective Cost': 'sum',
         'Savings': 'sum'
     }).reset_index()
-    combined_results = combined_results.sort_values(['reservation_subscription_id', 'reservation_reservation_a_r_n', 'RI Purchaser Account ID', 'Usage Account ID'])
+    combined_results = combined_results.sort_values(['reservation_subscription_id', 'reservation_reservation_a_r_n', 'Usage Account ID'])
     generate_detailed_csv(combined_results, args.output)
     processing_time = time.time() - start_time
     print(f"\nProcessing completed in {processing_time:.2f} seconds")
@@ -189,7 +212,6 @@ def main():
     print("=" * 80)
     n_ri = len(combined_results) - 1 if len(combined_results) > 0 else 0
     print(f"Total RI subscriptions analyzed: {n_ri}")
-    print(f"Total usage amount: {combined_results['Usage Amount'][:-1].astype(float).sum():.2f}")
     print(f"Total on-demand cost: ${combined_results['On-Demand Cost'][:-1].sum():.2f}")
     print(f"Total RI effective cost: ${combined_results['RI Effective Cost'][:-1].sum():.2f}")
     print(f"Total savings: ${combined_results['Savings'][:-1].sum():.2f}")
